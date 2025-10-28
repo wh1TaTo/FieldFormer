@@ -118,26 +118,52 @@ class Forward_Multihead_Attention_sparse(nn.Module):
 
 class FieldFormer_TAP(nn.Module):
     """
-    20*20*20->20*20*20
+    Rectangular support: (Lx,Ly,Lz) -> (Lx,Ly,Lz)
     """
 
-    def __init__(self, dropout_rate=0.01, depth=1):
+    def __init__(self, grid_size=20, dropout_rate=0.01, depth=1, subtensor_size=5, embed_dim=5, stride=3):
         super(FieldFormer_TAP, self).__init__()
-        e1, e2, e3=int(5), int(5), int(20)
-        self.stride = 3
+        # grid_size can be int or tuple(int,int,int)
+        if isinstance(grid_size, int):
+            Lx = Ly = Lz = int(grid_size)
+        else:
+            assert len(grid_size) == 3, "grid_size must be int or tuple of length 3"
+            Lx, Ly, Lz = [int(v) for v in grid_size]
+
+        # subtensor_size can be int (same for all axes) or tuple(int,int,int)
+        if isinstance(subtensor_size, int):
+            e1 = int(subtensor_size)
+            self.subtensor_size_tuple = (e1, e1, e1)
+        else:
+            assert len(subtensor_size) == 3, "subtensor_size must be int or tuple of length 3"
+            self.subtensor_size_tuple = tuple(int(v) for v in subtensor_size)
+            e1 = int(subtensor_size[0])  # For backward compatibility
+        
+        e2 = int(embed_dim)
+        self.Lx, self.Ly, self.Lz = Lx, Ly, Lz
+        self.stride = int(stride)
         self.depth = depth
         self.subtensor_size = e1
 
-        self.x = int((20-e1)/self.stride+1)
+        # number of sliding locations per axis
+        self.Nx = int((Lx - e1) / self.stride + 1)
+        self.Ny = int((Ly - e1) / self.stride + 1)
+        self.Nz = int((Lz - e1) / self.stride + 1)
 
-        self.patches = int((20-e1)/self.stride+1)**3
-        self.dim = e2**3
+        self.patches = int(self.Nx * self.Ny * self.Nz)
+        self.dim = int(e2 ** 3)
 
-        self.attention_blocks = nn.ModuleList([Forward_Attention_sparse(patches=self.patches, dim=self.dim, attn_drop=dropout_rate) for _ in range(self.depth)])
+        self.attention_blocks = nn.ModuleList([
+            Forward_Attention_sparse(patches=self.patches, dim=self.dim, attn_drop=dropout_rate)
+            for _ in range(self.depth)
+        ])
 
-        self.feature_dim = int((20-e1)/self.stride+1)**2
+        # feature dims per axis
+        self.fx = int(self.Nx * self.Nx)
+        self.fy = int(self.Ny * self.Ny)
+        self.fz = int(self.Nz * self.Nz)
 
-        self.decoder1 = TCL(input_shape=[self.feature_dim, self.feature_dim, self.feature_dim], rank=[e3, e3, e3])
+        self.decoder1 = TCL(input_shape=[self.fx, self.fy, self.fz], rank=[Lx, Ly, Lz])
         self.drop = nn.Dropout(p=dropout_rate)
 
     def forward_features(self,x):
@@ -157,11 +183,17 @@ class FieldFormer_TAP(nn.Module):
     def cut_tensor_into_sliding_patches(original_tensor, subtensor_size, stride):
         original_tensor = original_tensor.squeeze(0)
         oritensor_szie = original_tensor.shape
-        out_shape = int((oritensor_szie[0] - subtensor_size[0]) / stride + 1)
+        
+        # Ensure subtensor_size is a tuple
+        if isinstance(subtensor_size, int):
+            subtensor_size = (subtensor_size, subtensor_size, subtensor_size)
+        
+        out_x = int((oritensor_szie[0] - subtensor_size[0]) / stride + 1)
+        out_y = int((oritensor_szie[1] - subtensor_size[1]) / stride + 1)
+        out_z = int((oritensor_szie[2] - subtensor_size[2]) / stride + 1)
 
-        num_patch = out_shape ** 3
-        result_tensor = torch.empty((num_patch,) + subtensor_size)
-
+        num_patch = int(out_x * out_y * out_z)
+        result_tensor = torch.empty((num_patch,) + subtensor_size, device=original_tensor.device, dtype=original_tensor.dtype)
 
         count = 0
         for i in range(0, oritensor_szie[0] - subtensor_size[0] + 1, stride):
@@ -177,12 +209,13 @@ class FieldFormer_TAP(nn.Module):
     def forward(self, patches):
         x1 = patches.cuda()
         x2 = x1.squeeze(0)
-        x2 = x2.contiguous().view(self.patches, -1) 
-        x2 = x2.unsqueeze(0) 
+        x2 = x2.contiguous().view(self.patches, -1)
+        x2 = x2.unsqueeze(0)
         x3, att_map = self.forward_features(x2)
-        x3 = x3.view(self.x,self.x,self.x,self.x,self.x,self.x)
-        x3 = x3.permute(0,3,1,4,2,5)
-        x4 = x3.reshape(1,self.feature_dim,self.feature_dim,self.feature_dim)
+        # Reshape: (Nx,Ny,Nz,Nx,Ny,Nz) -> permute to group axes -> (fx,fy,fz)
+        x3 = x3.view(self.Nx, self.Ny, self.Nz, self.Nx, self.Ny, self.Nz)
+        x3 = x3.permute(0, 3, 1, 4, 2, 5)
+        x4 = x3.reshape(1, self.fx, self.fy, self.fz)
         x4 = self.drop(x4)
         x5 = self.decoder1(x4)
         return torch.tanh(x5), att_map
@@ -191,29 +224,55 @@ class FieldFormer_TAP(nn.Module):
 
 class FieldFormer_MHTAP(nn.Module):
     """
-    20*20*20->20*20*20
+    Rectangular support: (Lx,Ly,Lz) -> (Lx,Ly,Lz)
     """
 
-    def __init__(self, dropout_rate=0.3, depth=1, num_heads_tuple=(2, 2, 2)):
+    def __init__(self, grid_size=20, dropout_rate=0.3, depth=1, num_heads_tuple=(2, 2, 2), subtensor_size=5, embed_dim=5, stride=3):
         super(FieldFormer_MHTAP, self).__init__()
-        e1,e2=int(5), int(5)
+        if isinstance(grid_size, int):
+            Lx = Ly = Lz = int(grid_size)
+        else:
+            assert len(grid_size) == 3, "grid_size must be int or tuple of length 3"
+            Lx, Ly, Lz = [int(v) for v in grid_size]
+
+        # subtensor_size can be int (same for all axes) or tuple(int,int,int)
+        if isinstance(subtensor_size, int):
+            e1 = int(subtensor_size)
+            self.subtensor_size_tuple = (e1, e1, e1)
+        else:
+            assert len(subtensor_size) == 3, "subtensor_size must be int or tuple of length 3"
+            self.subtensor_size_tuple = tuple(int(v) for v in subtensor_size)
+            e1 = int(subtensor_size[0])  # For backward compatibility
+        
+        e2 = int(embed_dim)
         self.depth = depth
         self.subtensor_size = e1
-        self.stride = 3
-        self.patches = int((20-e1)/self.stride+1)**3
-        self.N = int((20-e1)/self.stride+1)
-        self.dim = int(e2**3)
+        self.stride = int(stride)
+
+        self.Nx = int((Lx - e1) / self.stride + 1)
+        self.Ny = int((Ly - e1) / self.stride + 1)
+        self.Nz = int((Lz - e1) / self.stride + 1)
+        self.patches = int(self.Nx * self.Ny * self.Nz)
+        self.dim = int(e2 ** 3)
         self.dim2 = int(64)
         self.num_head1 = num_heads_tuple[0]
         self.num_head2 = num_heads_tuple[1]
         self.num_head3 = num_heads_tuple[2]
-        self.num_heads = self.num_head1*self.num_head2*self.num_head3
-        self.attention_blocks = nn.ModuleList([Forward_Multihead_Attention_sparse(patches=self.patches, embeded_dim=self.dim, key_size = int(self.num_heads*self.dim2), num_heads= self.num_heads, attn_drop=dropout_rate ) for _ in range(self.depth)])
-        self.feature_dim = int((20-e1)/self.stride+1)**2
-        #self.encoder = TCL(input_shape=[20, 20, 20], rank=[self.feature_dim, self.feature_dim, self.feature_dim])
-        e3 = int(20)
-        #self.decoder1 = TCL(input_shape=[self.num_head1*self.feature_dim, self.num_head2*self.feature_dim, self.num_head3*self.feature_dim], rank=[e3, e3, e3])
-        self.decoder2 = TCL(input_shape=[self.num_head1*self.N *self.N, self.num_head2*self.N *self.N, self.num_head3*self.N *self.N], rank=[e3, e3, e3])
+        self.num_heads = self.num_head1 * self.num_head2 * self.num_head3
+        self.attention_blocks = nn.ModuleList([
+            Forward_Multihead_Attention_sparse(
+                patches=self.patches,
+                embeded_dim=self.dim,
+                key_size=int(self.num_heads * self.dim2),
+                num_heads=self.num_heads,
+                attn_drop=dropout_rate
+            ) for _ in range(self.depth)
+        ])
+        # feature dims per axis (times heads per axis)
+        self.fx = int(self.num_head1 * self.Nx * self.Nx)
+        self.fy = int(self.num_head2 * self.Ny * self.Ny)
+        self.fz = int(self.num_head3 * self.Nz * self.Nz)
+        self.decoder2 = TCL(input_shape=[self.fx, self.fy, self.fz], rank=[Lx, Ly, Lz])
         self.drop = nn.Dropout(p=dropout_rate)
 
     def forward_features(self,x):
@@ -228,9 +287,16 @@ class FieldFormer_MHTAP(nn.Module):
     def cut_tensor_into_sliding_patches(original_tensor, subtensor_size, stride):
         original_tensor = original_tensor.squeeze(0)
         oritensor_szie = original_tensor.shape
-        out_shape = int((oritensor_szie[0] - subtensor_size[0]) / stride + 1)
-        num_patch = out_shape ** 3
-        result_tensor = torch.empty((num_patch,) + subtensor_size)
+        
+        # Ensure subtensor_size is a tuple
+        if isinstance(subtensor_size, int):
+            subtensor_size = (subtensor_size, subtensor_size, subtensor_size)
+        
+        out_x = int((oritensor_szie[0] - subtensor_size[0]) / stride + 1)
+        out_y = int((oritensor_szie[1] - subtensor_size[1]) / stride + 1)
+        out_z = int((oritensor_szie[2] - subtensor_size[2]) / stride + 1)
+        num_patch = int(out_x * out_y * out_z)
+        result_tensor = torch.empty((num_patch,) + subtensor_size, device=original_tensor.device, dtype=original_tensor.dtype)
         count = 0
         for i in range(0, oritensor_szie[0] - subtensor_size[0] + 1, stride):
             for j in range(0, oritensor_szie[1] - subtensor_size[1] + 1, stride):
@@ -245,12 +311,17 @@ class FieldFormer_MHTAP(nn.Module):
     def forward(self, patches):
         x1 = patches.cuda()
         x2 = x1.squeeze(0)
-        x2 = x2.contiguous().view(self.patches, -1)  
-        x2 = x2.unsqueeze(0) 
+        x2 = x2.contiguous().view(self.patches, -1)
+        x2 = x2.unsqueeze(0)
         x3, att_map = self.forward_features(x2)
-        x4 = x3.view(self.num_head1, self.num_head2, self.num_head3, self.N, self.N, self.N, self.N, self.N, self.N )
+        # Reshape to (h1,h2,h3,Nx,Ny,Nz,Nx,Ny,Nz)
+        x4 = x3.view(self.num_head1, self.num_head2, self.num_head3,
+                     self.Nx, self.Ny, self.Nz, self.Nx, self.Ny, self.Nz)
         x4 = x4.permute(0, 3, 6, 1, 4, 7, 2, 5, 8)
-        x4 = x4.reshape(1, self.num_head1*self.N *self.N, self.num_head2*self.N *self.N, self.num_head3*self.N *self.N)
+        x4 = x4.reshape(1,
+                        self.num_head1 * self.Nx * self.Nx,
+                        self.num_head2 * self.Ny * self.Ny,
+                        self.num_head3 * self.Nz * self.Nz)
         x4 = self.drop(x4)
         x5 = self.decoder2(x4)
         return torch.tanh(x5), att_map

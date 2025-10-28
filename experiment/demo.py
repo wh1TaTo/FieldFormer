@@ -81,7 +81,7 @@ def train_and_evaluate(model,  optimizer, loss_fn,  x_ob, x_true, observation_te
     start_time = time.time()
 
 
-    X_input = model.cut_tensor_into_sliding_patches(x_ob_tensor, subtensor_size=(model.subtensor_size, model.subtensor_size, model.subtensor_size), stride=model.stride)
+    X_input = model.cut_tensor_into_sliding_patches(x_ob_tensor, subtensor_size=model.subtensor_size_tuple, stride=model.stride)
 
     for epoch in tqdm(range(num_epochs)):
         output, _ = model(X_input)
@@ -174,13 +174,13 @@ def train_and_evaluate_tnn(model,  optimizer, loss_fn,  x_ob, x_true, observatio
 if __name__=="__main__":
     #hyperparameters
     nmod = 3
-
-
     num_epochs= 5000
     num_epochs_tnn= 5000
     learning_rate1=4e-3
     learning_rate2=4e-3
     learning_rate_tnn= 4e-3
+    subtensor_size = 5  # Can be int (same for all axes) or tuple (Sx, Sy, Sz)
+
 
     cuda_is_available=torch.cuda.is_available()
     device=torch.cuda.current_device()
@@ -193,8 +193,8 @@ if __name__=="__main__":
 
 
     dropout_rate = 0.3
-    model1 = net.FieldFormer_TAP(dropout_rate).cuda()
-    model2 = net.FieldFormer_MHTAP(dropout_rate).cuda()
+    model1 = net.FieldFormer_TAP(dropout_rate=dropout_rate, subtensor_size=subtensor_size).cuda()
+    model2 = net.FieldFormer_MHTAP(dropout_rate=dropout_rate, subtensor_size=subtensor_size).cuda()
 
     tnn_model = net.TNN().cuda() if cuda_is_available else net.TNN()
 
