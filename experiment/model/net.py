@@ -10,12 +10,33 @@ import math
 from sparsemax import Sparsemax
 
 
+def compute_distance_bias(n_patches, Nx, Ny, Nz, alpha, w, device):
+    """Compute 3D distance-based bias: B_ij = -alpha * ((euclidean_dist_ij/w)**2)"""
+    indices = torch.arange(n_patches, device=device)
+    
+    # Convert linear patch indices to 3D coordinates
+    i_coords = torch.stack([
+        indices // (Ny * Nz),           # x coordinate
+        (indices % (Ny * Nz)) // Nz,    # y coordinate
+        indices % Nz                     # z coordinate
+    ], dim=1)  # Shape: [n_patches, 3]
+    
+    # Compute pairwise Euclidean distances
+    distances = torch.cdist(i_coords.float(), i_coords.float())  # Shape: [n_patches, n_patches]
+    
+    # Compute distance bias
+    bias = -alpha * ((distances / w) ** 2)
+    return bias
+
 
 class Forward_Attention_sparse(nn.Module):
-    def __init__(self, patches, dim, attn_drop=0):
+    def __init__(self, patches, dim, Nx, Ny, Nz, attn_drop=0, use_distance_bias=False, alpha=1.0, w=10.0):
         super().__init__()
         self.dim = dim
         self.patches = patches
+        self.Nx = Nx
+        self.Ny = Ny
+        self.Nz = Nz
         self.dim2 = int(1*dim)
         self.qw = nn.Linear(dim, self.dim2, bias=False)
         self.kw = nn.Linear(dim, self.dim2, bias=False)
@@ -23,8 +44,11 @@ class Forward_Attention_sparse(nn.Module):
         self.bn=nn.BatchNorm2d(self.patches)
         self.softmax=nn.Softmax(dim=2)
         self.sparsemax=Sparsemax(dim=2)
-
-
+        
+        self.use_distance_bias = use_distance_bias
+        self.alpha = alpha
+        self.w = w
+        self.distance_bias = None
 
 
     def forward(self, x):
@@ -36,24 +60,35 @@ class Forward_Attention_sparse(nn.Module):
         K = F.normalize(K, p=2, dim=2)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.dim)
+        
+        if self.use_distance_bias:
+            if self.distance_bias is None or self.distance_bias.device != scores.device:
+                self.distance_bias = compute_distance_bias(self.patches, self.Nx, self.Ny, self.Nz, self.alpha, self.w, scores.device)
+            scores = scores + self.distance_bias
+        
         scores = self.att_drop(scores)
         scores = self.sparsemax(scores)
         return scores
 
 
 class Forward_Attention_soft(nn.Module):
-    def __init__(self, patches, dim, attn_drop=0.2):
+    def __init__(self, patches, dim, Nx, Ny, Nz, attn_drop=0.2, use_distance_bias=False, alpha=1.0, w=10.0):
         super().__init__()
         self.dim = dim
         self.patches = patches
+        self.Nx = Nx
+        self.Ny = Ny
+        self.Nz = Nz
         self.qw = nn.Linear(dim, dim, bias=False)
         self.vw = nn.Linear(dim, dim, bias=False)
         self.att_drop=nn.Dropout(attn_drop)
         self.bn=nn.BatchNorm2d(self.patches)
         self.softmax=nn.Softmax(dim=2)
-        # self.sparsemax=Sparsemax(dim=2)
-
-
+        
+        self.use_distance_bias = use_distance_bias
+        self.alpha = alpha
+        self.w = w
+        self.distance_bias = None
 
 
     def forward(self, x):
@@ -63,16 +98,25 @@ class Forward_Attention_soft(nn.Module):
         V=self.bn(self.vw(input=x).unsqueeze(-1) ).squeeze(-1)
 
         scores = torch.matmul(Q, V.transpose(-2, -1)) / math.sqrt(self.dim)
+        
+        if self.use_distance_bias:
+            if self.distance_bias is None or self.distance_bias.device != scores.device:
+                self.distance_bias = compute_distance_bias(self.patches, self.Nx, self.Ny, self.Nz, self.alpha, self.w, scores.device)
+            scores = scores + self.distance_bias
+        
         scores = self.att_drop(scores)
         scores = self.softmax(scores)
         return scores
 
 
 class Forward_Multihead_Attention_sparse(nn.Module):
-    def __init__(self, patches, embeded_dim, key_size, num_heads, attn_drop=0.3):
+    def __init__(self, patches, Nx, Ny, Nz, embeded_dim, key_size, num_heads, attn_drop=0.3, use_distance_bias=False, alpha=1.0, w=10.0):
         super().__init__()
         self.embeded_dim = embeded_dim
         self.patches = patches
+        self.Nx = Nx
+        self.Ny = Ny
+        self.Nz = Nz
         self.num_heads = num_heads
         self.qw = nn.Linear(embeded_dim, key_size, bias=False)
         self.kw = nn.Linear(embeded_dim, key_size, bias=False)
@@ -84,14 +128,13 @@ class Forward_Multihead_Attention_sparse(nn.Module):
         self.sparsemax = Sparsemax(dim=1)
         self.softmax= nn.Softmax(dim=1)
 
-
         self.dim_multihead_concate = int(num_heads * patches)
-
         self.bn = nn.BatchNorm2d(self.num_heads)
-
-
-
-
+        
+        self.use_distance_bias = use_distance_bias
+        self.alpha = alpha
+        self.w = w
+        self.distance_bias = None
 
 
     def forward(self, x):
@@ -105,6 +148,11 @@ class Forward_Multihead_Attention_sparse(nn.Module):
         K = F.normalize(K, p=2, dim=3)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.embeded_dim)
+        
+        if self.use_distance_bias:
+            if self.distance_bias is None or self.distance_bias.device != scores.device:
+                self.distance_bias = compute_distance_bias(self.patches, self.Nx, self.Ny, self.Nz, self.alpha, self.w, scores.device)
+            scores = scores + self.distance_bias.unsqueeze(0).unsqueeze(0)
 
         scores = scores.transpose(1, 2).reshape(B, N, self.dim_multihead_concate)
 
@@ -121,7 +169,7 @@ class FieldFormer_TAP(nn.Module):
     Rectangular support: (Lx,Ly,Lz) -> (Lx,Ly,Lz)
     """
 
-    def __init__(self, grid_size=20, dropout_rate=0.01, depth=1, subtensor_size=5, embed_dim=5, stride=3):
+    def __init__(self, grid_size=20, dropout_rate=0.01, depth=1, subtensor_size=5, embed_dim=5, stride=3, use_distance_bias=False, alpha=1.0, w=10.0):
         super(FieldFormer_TAP, self).__init__()
         # grid_size can be int or tuple(int,int,int)
         if isinstance(grid_size, int):
@@ -154,7 +202,8 @@ class FieldFormer_TAP(nn.Module):
         self.dim = int(e2 ** 3)
 
         self.attention_blocks = nn.ModuleList([
-            Forward_Attention_sparse(patches=self.patches, dim=self.dim, attn_drop=dropout_rate)
+            Forward_Attention_sparse(patches=self.patches, dim=self.dim, Nx=self.Nx, Ny=self.Ny, Nz=self.Nz, attn_drop=dropout_rate, 
+                                    use_distance_bias=use_distance_bias, alpha=alpha, w=w)
             for _ in range(self.depth)
         ])
 
@@ -227,7 +276,7 @@ class FieldFormer_MHTAP(nn.Module):
     Rectangular support: (Lx,Ly,Lz) -> (Lx,Ly,Lz)
     """
 
-    def __init__(self, grid_size=20, dropout_rate=0.3, depth=1, num_heads_tuple=(2, 2, 2), subtensor_size=5, embed_dim=5, stride=3):
+    def __init__(self, grid_size=20, dropout_rate=0.3, depth=1, num_heads_tuple=(2, 2, 2), subtensor_size=5, embed_dim=5, stride=3, use_distance_bias=False, alpha=1.0, w=10.0):
         super(FieldFormer_MHTAP, self).__init__()
         if isinstance(grid_size, int):
             Lx = Ly = Lz = int(grid_size)
@@ -262,10 +311,16 @@ class FieldFormer_MHTAP(nn.Module):
         self.attention_blocks = nn.ModuleList([
             Forward_Multihead_Attention_sparse(
                 patches=self.patches,
+                Nx=self.Nx,
+                Ny=self.Ny,
+                Nz=self.Nz,
                 embeded_dim=self.dim,
                 key_size=int(self.num_heads * self.dim2),
                 num_heads=self.num_heads,
-                attn_drop=dropout_rate
+                attn_drop=dropout_rate,
+                use_distance_bias=use_distance_bias,
+                alpha=alpha,
+                w=w
             ) for _ in range(self.depth)
         ])
         # feature dims per axis (times heads per axis)

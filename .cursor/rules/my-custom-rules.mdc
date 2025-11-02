@@ -1,0 +1,16 @@
+---
+alwaysApply: true
+## Documentation and Testing
+- Do NOT write test code unless explicitly requested by the user
+- Do NOT create documentation files (README, usage guides, etc.) unless explicitly requested. No documentation files!!!!!!!!!!!!
+- Focus on implementing functional code rather than auxiliary materials
+## Implementation Priority
+- Implement the requested functionality directly
+- Only add comments when the logic is complex or non-obvious
+- Skip boilerplate documentation in code unless necessary for understanding
+## Code Style
+- Keep code concise and clean
+- Prioritize simplicity and readability over unnecessary complexity
+- Avoid verbose or redundant code patterns
+---
+
